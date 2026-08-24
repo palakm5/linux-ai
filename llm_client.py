@@ -178,6 +178,8 @@ def call_llm(
     model: Optional[str] = None,
     temperature: float = 0.2,
     max_tokens: int = 1024,
+    **kwargs,           # forwarded verbatim to client.chat.completions.create()
+                        # e.g. extra_body={"options": {"num_ctx": 4096}} for Ollama
 ) -> dict:
     """
     Call the LLM and return a parsed JSON dict.
@@ -236,6 +238,7 @@ def call_llm(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            **kwargs,
         )
     except openai.AuthenticationError as exc:
         raise LLMError(f"Authentication failed for {provider_name!r}: {exc}") from exc

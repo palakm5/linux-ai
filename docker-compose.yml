@@ -73,28 +73,13 @@ services:
     networks:
       - linuxai_net
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 15s
-    # Pull both models automatically on first start
-    # Override with OLLAMA_MODEL / OLLAMA_SAFETY_MODEL env vars
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        ollama serve &
-        OLLAMA_PID=$$!
-        echo "Waiting for Ollama to be ready..."
-        until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do
-          sleep 1
-        done
-        echo "Pulling main model: ${OLLAMA_MODEL:-llama3} ..."
-        ollama pull ${OLLAMA_MODEL:-llama3}
-        echo "Pulling safety model: ${OLLAMA_SAFETY_MODEL:-mistral} ..."
-        ollama pull ${OLLAMA_SAFETY_MODEL:-mistral}
-        echo "Both models ready. Ollama is up."
-        wait $$OLLAMA_PID
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+    # Uses the default ollama/ollama entrypoint (runs `ollama serve` automatically).
+    # Pull models AFTER the container is healthy — see usage instructions below.
 
 # ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:

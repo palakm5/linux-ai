@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 # LangChain LCEL imports (langchain-core)
@@ -99,11 +100,25 @@ def initial_state(query: str, provider: Optional[str] = None) -> WorkflowState:
 # --------------------------------------------------------------------------- #
 
 def _call_with_retry(
-    system: str, user: str, provider: Optional[str], label: str
+    system: str, user: str, provider: Optional[str], label: str,
+    max_tokens: int = 1024,
 ) -> dict:
+    """
+    Call call_llm() with one automatic retry on transient LLM errors.
+
+    For Ollama, passes num_ctx=4096 via extra_body to expand the context
+    window beyond the 2048-token default (which caused 'unexpected EOF').
+    """
+    # Ollama: expand context window so long prompts don't overflow
+    active = provider or os.environ.get("LINUXAI_PROVIDER", "openrouter")
+    extra_kw: dict = {}
+    if active == "ollama":
+        extra_kw["extra_body"] = {"options": {"num_ctx": 4096}}
+
     for attempt in (1, 2):
         try:
-            return call_llm(system, user, provider=provider)
+            return call_llm(system, user, provider=provider,
+                            max_tokens=max_tokens, **extra_kw)
         except LLMError as exc:
             if attempt == 1:
                 logger.warning("[%s] attempt 1 failed: %s", label, exc)
@@ -111,8 +126,26 @@ def _call_with_retry(
                 raise LLMError(f"[{label}] failed after 2 attempts: {exc}") from exc
 
 
-def _memory_text(memory: List[Dict]) -> str:
-    return json.dumps(memory, indent=2) if memory else "[]"
+def _memory_text(memory: List[Dict], max_result_chars: int = 500) -> str:
+    """
+    Serialise investigation memory to a JSON string.
+
+    Each tool result is truncated to `max_result_chars` characters so the
+    combined diagnosis prompt fits inside Ollama's default context window
+    (2048 tokens).  Cloud providers are unaffected — their windows are much
+    larger and the truncation threshold is generous enough for all key data.
+    """
+    if not memory:
+        return "[]"
+    trimmed = []
+    for entry in memory:
+        e = dict(entry)
+        if "result" in e:
+            txt = json.dumps(e["result"])
+            if len(txt) > max_result_chars:
+                e["result"] = {"output": txt[:max_result_chars] + " …[truncated]"}
+        trimmed.append(e)
+    return json.dumps(trimmed, indent=2)
 
 
 def _validate_tool(name: str) -> bool:
@@ -183,12 +216,12 @@ Zero-argument tools (tool_args = {{}}):
   check_open_ports      - listening TCP/UDP ports
   check_dirs            - du for /var/log and /home
 
-Parameterized tools:
-  check_directory_size(path)   - allowed: /var/log /home /tmp /var/cache /var/lib
-  check_process_by_name(name)  - letters/digits/dash/underscore only
-  check_network(host)          - plain hostname or IPv4
-  check_service_status(service_name) - letters/digits/dash/underscore only
-  find_files(pattern, path)    - natural-language file search
+Parameterized tools — tool_args MUST include the named argument (never leave empty):
+  check_directory_size  → tool_args: {{"path": "/var/log"}}   allowed: /var/log /home /tmp /var/cache /var/lib
+  check_process_by_name → tool_args: {{"name": "nginx"}}      letters/digits/dash/underscore only
+  check_network         → tool_args: {{"host": "8.8.8.8"}}    plain hostname or IPv4
+  check_service_status  → tool_args: {{"service_name": "ssh"}} letters/digits/dash/underscore only
+  find_files            → tool_args: {{"pattern": "*.log", "path": "/var/log"}}
 
 {failed_note}
 
@@ -197,6 +230,7 @@ Rules:
 - Set sufficient=true when you have enough information to diagnose.
 - Do NOT repeat a tool already in memory.
 - After {max_iter} total calls you MUST set sufficient=true.
+- Parameterized tools with empty tool_args will FAIL — always supply the required argument.
 
 Respond ONLY with JSON:
 {{
@@ -333,7 +367,8 @@ def step_diagnose(state: WorkflowState) -> WorkflowState:
     )
 
     try:
-        raw = _call_with_retry(_DIAGNOSE_SYSTEM, diagnose_user, provider, "diagnose")
+        raw = _call_with_retry(_DIAGNOSE_SYSTEM, diagnose_user, provider, "diagnose",
+                               max_tokens=512)
     except LLMError as exc:
         state["diagnosis"] = f"Diagnosis failed: {exc}"
         state["commands"]  = []

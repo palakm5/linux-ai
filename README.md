@@ -1,6 +1,6 @@
 # 🐧 linuxai
 
-AI-powered Linux diagnostic & file-search CLI.
+AI-powered Linux diagnostic & file-search CLI — with an agentic reasoning loop, three-layer safety review, and support for NVIDIA NIM, OpenRouter, or fully local Ollama models.
 
 Instead of one shallow LLM call, **linuxai investigates problems step by step** — running real system commands, reading the results, deciding what to check next, running a three-layer safety review on every recommended fix, and verifying the fix worked. If it didn't, it re-plans and tries again.
 
@@ -38,9 +38,10 @@ Your query
 ┌──────────────────────────────────────────────────────────┐
 │  Three-layer safety review  (safety.py)                  │
 │                                                          │
-│  Layer 1 — generator tag (diagnosis LLM's own label)     │
+│  Layer 1 — generator tag  (diagnosis LLM's own label)    │
 │  Layer 2 — deterministic pattern check  (no LLM)         │
 │  Layer 3 — independent LLM review  (zero context)        │
+│            → uses OLLAMA_SAFETY_MODEL if provider=ollama │
 │                                                          │
 │  Strictest wins: any "caution" → final tag = caution     │
 └──────────┬───────────────────────────────────────────────┘
@@ -76,14 +77,17 @@ Your query
 ```
 linuxai/
 ├── cli.py            # entrypoint — argparse, display, [y/N] gate, bounded retry
-├── agent.py          # classify → plan → diagnose (used by orchestrator)
 ├── orchestrator.py   # LangChain LCEL workflow + explicit state management
-├── safety.py         # three-layer safety classifier
+├── safety.py         # three-layer safety classifier + dual-model Ollama support
+├── agent.py          # classify → plan → diagnose (used by orchestrator)
 ├── gap_log.py        # local JSONL log of unsupported tool requests
 ├── tools.py          # whitelisted subprocess wrappers (11 tools)
-├── llm_client.py     # OpenRouter + NVIDIA NIM dual-path LLM wrapper
+├── llm_client.py     # OpenRouter / NVIDIA NIM / Ollama LLM wrapper
+├── test_all.py       # 51 unit + integration tests (no API key needed)
+├── .env              # API keys + provider config (never committed)
+├── docker-compose.yml  # profiles: cloud (NVIDIA/OpenRouter) and ollama
 ├── docker/
-│   ├── Dockerfile        # Ubuntu 22.04 + Python + linuxai
+│   ├── Dockerfile        # Ubuntu 22.04 + Python + all dependencies
 │   └── seed_problems.sh  # seeds fake disk/memory issues for demo
 └── README.md
 ```
@@ -95,20 +99,26 @@ linuxai/
 ### 1. Install dependencies
 
 ```bash
-pip3 install openai langchain langchain-core
+pip3 install openai langchain langchain-core python-dotenv
 ```
 
-### 2. Set your API key
+### 2. Configure `.env`
 
-**OpenRouter** (free tier available — recommended):
-```bash
-export OPENROUTER_API_KEY=sk-or-...
-```
+Create a `.env` file in the project root — it is loaded automatically, no `export` needed:
 
-**NVIDIA NIM** (alternative):
 ```bash
-export NVIDIA_API_KEY=nvapi-...
-export LINUXAI_PROVIDER=nvidia
+# Choose provider: nvidia | openrouter | ollama
+LINUXAI_PROVIDER=nvidia
+
+# NVIDIA NIM
+NVIDIA_API_KEY=nvapi-...
+
+# OpenRouter
+OPENROUTER_API_KEY=sk-or-...
+
+# Ollama (local — no key required)
+# OLLAMA_MODEL=llama3
+# OLLAMA_SAFETY_MODEL=mistral
 ```
 
 ### 3. Run
@@ -121,81 +131,146 @@ python3 cli.py "what process is eating CPU?"
 python3 cli.py "find all PDF files in /home"
 python3 cli.py "is nginx running?"
 python3 cli.py "check disk usage in /var/log"
-python3 cli.py --provider nvidia "why is my disk full?"
+python3 cli.py --provider openrouter "why is my disk full?"
+```
+
+### 4. Run tests (no API key needed)
+
+```bash
+python3 test_all.py          # plain output — 51 tests
+python3 -m pytest test_all.py -v  # verbose with pytest
+```
+
+---
+
+## LLM providers
+
+Three providers — all use the **same `call_llm()` code path** in `llm_client.py`. Switch with one line in `.env`.
+
+| Provider | Key needed? | Privacy | Default model |
+|---|---|---|---|
+| NVIDIA NIM | ✅ `NVIDIA_API_KEY` | Cloud | `meta/llama-3.1-8b-instruct` |
+| OpenRouter | ✅ `OPENROUTER_API_KEY` | Cloud | `mistralai/mistral-7b-instruct:free` |
+| Ollama | ❌ None — runs offline | 100% local | `llama3` |
+
+### Two separate Ollama models
+
+When using Ollama, linuxai uses **two different local models** for the two LLM call types:
+
+```
+Your query
+    │
+    ▼
+classify / plan / diagnose  →  OLLAMA_MODEL        (e.g. llama3  — heavier, smarter)
+    │
+    ▼ (each recommended command)
+independent safety review   →  OLLAMA_SAFETY_MODEL (e.g. mistral — lighter, faster)
+                               falls back to OLLAMA_MODEL if not set
+```
+
+This lets a capable model do the reasoning while a fast, lightweight model handles the binary safe/caution classification.
+
+### Using Ollama (local, private, no API key)
+
+```bash
+# 1. Install Ollama: https://ollama.com/download
+
+# 2. Pull both models
+ollama pull llama3    # main planning/diagnosis model
+ollama pull mistral   # safety review model (lighter)
+
+# 3. Set in .env
+LINUXAI_PROVIDER=ollama
+OLLAMA_MODEL=llama3
+OLLAMA_SAFETY_MODEL=mistral
+
+# 4. Run — fully offline
+python3 cli.py "why is my disk full?"
 ```
 
 ---
 
 ## Docker demo (full Linux environment)
 
-### Install Docker Desktop (macOS)
-
-1. Download from **https://www.docker.com/products/docker-desktop/**
-2. Open the `.dmg`, drag Docker to Applications, launch it
-3. Wait for the whale icon to stop animating (~30 s)
-4. Verify: `docker --version`
-
-### Build the image
+### Option A — Cloud providers (NVIDIA / OpenRouter)
 
 ```bash
 cd linuxai/
-docker build -f docker/Dockerfile -t linuxai .
+
+# Start
+docker compose --profile cloud up -d
+
+# Enter interactive session
+docker compose exec linuxai bash
+
+# Inside:
+seed_problems disk
+linuxai "why is my disk full?"
 ```
 
-### Run the container
+### Option B — Ollama (local models, fully private)
 
 ```bash
-docker run -it \
-  -e OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
-  linuxai
+# Start both containers (Ollama starts serving immediately)
+docker compose --profile ollama up -d
+
+# Pull models into the Ollama container (one-time, ~9 GB total)
+docker exec ollama ollama pull llama3
+docker exec ollama ollama pull mistral
+
+# Enter linuxai
+docker exec -it linuxai bash
+
+# Inside — Ollama is reachable at http://ollama:11434 automatically:
+export LINUXAI_PROVIDER=ollama
+export OLLAMA_MODEL=llama3
+export OLLAMA_SAFETY_MODEL=mistral
+
+seed_problems disk
+linuxai "why is my disk full?"
 ```
 
-You'll get a bash shell inside Ubuntu 22.04.
+Models are stored in the `ollama_models` Docker volume — **no re-download on restart**.
 
 ### Seed problems & demo
 
 ```bash
 # Inside the container:
+seed_problems disk     # 500 MB fake log in /var/log (simulates disk bloat)
+seed_problems memory   # stress-ng at 70% RAM for 600s (background)
+seed_problems all      # disk + memory
+seed_problems clean    # remove everything seeded
 
-# Seed a 500 MB fake log file (simulates disk bloat)
-seed_problems disk
-
-# Seed memory pressure (stress-ng at 70% RAM, background)
-seed_problems memory
-
-# Seed both at once
-seed_problems
-
-# Run linuxai — it investigates step by step, then asks before running fixes
 linuxai "why is my disk full?"
-linuxai "my system feels slow"
-linuxai "is nginx running?"
+linuxai "memory usage is high"
 linuxai "find all log files in /var"
+linuxai "is ssh running?"
+```
 
-# The CLI shows a before/after comparison after each approved fix.
-# If the fix didn't work, it re-plans automatically (bounded to 1 retry).
+### Switch providers inside Docker
 
-# Clean up seeded files
-seed_problems clean
+```bash
+# NVIDIA
+docker run -it \
+  -e LINUXAI_PROVIDER=nvidia \
+  -e NVIDIA_API_KEY=$NVIDIA_API_KEY \
+  linuxai bash
+
+# OpenRouter
+docker run -it \
+  -e LINUXAI_PROVIDER=openrouter \
+  -e OPENROUTER_API_KEY=$OPENROUTER_API_KEY \
+  linuxai bash
 ```
 
 ### `seed_problems` modes
 
 | Command | What it does |
 |---|---|
-| `seed_problems` | Disk bloat + memory pressure |
 | `seed_problems disk` | 500 MB dummy log in `/var/log` |
-| `seed_problems memory` | `stress-ng` at 70% RAM for 600s, background |
+| `seed_problems memory` | `stress-ng` at 70% RAM for 600 s (background) |
+| `seed_problems all` | Disk bloat + memory pressure |
 | `seed_problems clean` | Remove seeded file + kill stress-ng |
-
-### Switch providers inside the container
-
-```bash
-docker run -it \
-  -e NVIDIA_API_KEY=$NVIDIA_API_KEY \
-  -e LINUXAI_PROVIDER=nvidia \
-  linuxai
-```
 
 ---
 
@@ -208,21 +283,21 @@ docker run -it \
 | `check_disk` | `df -h` | Filesystem usage across all mounts |
 | `check_dirs` | `du -sh /var/log /home` | Key directory sizes |
 | `check_memory` | `free -h` | RAM + swap |
-| `check_processes` | `ps aux --sort=-%mem` | Top 10 processes by memory |
+| `check_processes` | `ps aux` (sorted by mem) | Top 10 processes by memory |
 | `check_logs` | `journalctl -p err` / `dmesg` | Last 20 error log entries |
 | `check_open_ports` | `ss -tulwn` | Listening TCP/UDP ports |
 
 ### Parameterized tools (LLM supplies validated args)
 
-| Tool | Args | Validation | Command |
-|---|---|---|---|
-| `check_directory_size` | `path` | Must be under `/var/log`, `/home`, `/tmp`, `/var/cache`, or `/var/lib`. Path traversal (`../../`) is resolved and rejected. | `du -sh <path>` |
-| `check_process_by_name` | `name` | Letters, digits, dash, underscore only. Shell metacharacters rejected. Filtering done in Python, not shell. | `ps aux` + Python filter |
-| `check_network` | `host` | RFC-1123 hostname or IPv4 only. `;`, `\|`, `&`, `` ` ``, `$`, spaces rejected. | `ping -c 4 <host>` |
-| `check_service_status` | `service_name` | Letters, digits, dash, underscore only. | `systemctl status <name>` |
-| `find_files` | `pattern`, `path` | Natural-language or glob. Time keywords resolved. | `find <path> -iname <glob>` |
+| Tool | Args | Validation |
+|---|---|---|
+| `check_directory_size` | `path` | Must be under `/var/log`, `/home`, `/tmp`, `/var/cache`, `/var/lib`. Path traversal resolved and rejected. |
+| `check_process_by_name` | `name` | Letters, digits, dash, underscore only. Filtering in Python, not shell. |
+| `check_network` | `host` | RFC-1123 hostname or IPv4 only. `;`, `\|`, `&`, `` ` ``, `$`, spaces rejected. |
+| `check_service_status` | `service_name` | Letters, digits, dash, underscore only. |
+| `find_files` | `pattern`, `path` | Natural-language or glob. |
 
-All parameterized tools use `subprocess.run([...], shell=False)` — **no shell injection is possible**.
+All parameterized tools use `subprocess.run([...], shell=False)` — **no shell injection is possible.**
 
 ---
 
@@ -239,7 +314,7 @@ Layer 1 — Generator tag
 
         │
         ▼
-Layer 2 — Deterministic pattern check  (safety.py — no LLM)
+Layer 2 — Deterministic pattern check  (safety.py — no LLM, always runs)
   Regex patterns that ALWAYS flag caution, regardless of LLM opinion:
   • rm -rf /          • dd of=/dev/*
   • mkfs              • chmod -R 777 /
@@ -250,27 +325,29 @@ Layer 2 — Deterministic pattern check  (safety.py — no LLM)
         ▼
 Layer 3 — Independent LLM safety review  (safety.py)
   A second LLM call with ZERO context about why the command was suggested.
-  Sees only the command. Defaults to "caution" when uncertain.
+  Sees only the command. Defaults to "caution" on any LLM error.
+  When provider=ollama, uses OLLAMA_SAFETY_MODEL (lighter/faster model).
 
         │
         ▼
   Strictest wins:
-  safe + safe + safe  →  safe
+  safe + safe + safe     →  safe
   safe + caution + safe  →  caution
   caution + safe + safe  →  caution
 ```
 
 The reasoning is shown in the CLI next to every caution command:
 ```
-[CAUTION] rm -f /var/log/fake_bloat.log
-  ⚠ Why flagged: This command permanently deletes a file with no way to recover it.
+[1] ⚠️  caution
+    $ rm -f /var/log/fake_bloat.log
+    ⚠ Why flagged: This command permanently deletes a file with no way to recover it.
 ```
 
 ---
 
 ## Bounded fix-retry
 
-If a fix runs but verification shows the problem persists, linuxai automatically re-plans — **once** (hard cap `MAX_FIX_RETRIES = 1`).
+If a fix runs but verification shows the problem persists, linuxai re-plans — **once** (hard cap `MAX_FIX_RETRIES = 1`).
 
 ```
 Fix approved → Execute → Verify
@@ -300,7 +377,7 @@ The retry planner explicitly sees the failed command and is instructed not to re
 
 ## Gap logging
 
-When the LLM requests a tool that doesn't exist in the whitelist, the request is rejected (never executed) and logged locally to `tool_gap_log.jsonl`:
+When the LLM requests a tool not in the whitelist, it is rejected (never executed) and logged locally:
 
 ```json
 {
@@ -324,17 +401,18 @@ Gap logs are **strictly local** — nothing is uploaded anywhere.
 
 ## LangChain orchestration
 
-LangChain organises the workflow using LCEL (LangChain Expression Language). It never replaces the underlying components — it coordinates them.
+LangChain LCEL organises the workflow without replacing any underlying component.
 
 ```
 orchestrator.py  (LangChain LCEL chain)
     │
-    ├── step_classify     → classify query type
-    ├── step_investigate  → agentic loop (calls tools.py via whitelist)
-    ├── step_diagnose     → final LLM diagnosis call
-    └── step_safety_review → three-layer review for all commands
+    ├── step_classify       → file search OR diagnostic?
+    ├── step_file_search    → fast path: find_files() and return
+    ├── step_investigate    → agentic loop (whitelist → tools.py → memory)
+    ├── step_diagnose       → final LLM diagnosis call
+    └── step_safety_review  → three-layer review for all commands
 
-Explicit workflow state (WorkflowState TypedDict):
+WorkflowState (TypedDict):
   query, memory, diagnosis, commands, verification_tool,
   fix_command, failed_commands, fix_retry_count, resolved,
   provider, iterations_used, is_file_search, file_search_results
@@ -344,71 +422,39 @@ Explicit workflow state (WorkflowState TypedDict):
 
 ---
 
+## Ollama-specific reliability fixes
+
+Running large prompts through local Ollama models with a small default context window (2048 tokens) caused `HTTP 500 unexpected EOF`. Three fixes are applied automatically when `LINUXAI_PROVIDER=ollama`:
+
+| Fix | Where | What it does |
+|---|---|---|
+| Context window expansion | `_call_with_retry()` | Passes `num_ctx=4096` via `extra_body` — doubles the window |
+| Memory truncation | `_memory_text()` | Each tool result capped at 500 chars before entering the prompt |
+| Smaller response budget | `step_diagnose()` | `max_tokens` reduced 1024 → 512 for compact JSON output |
+
+Cloud providers (NVIDIA, OpenRouter) are unaffected — these settings only activate when `provider == "ollama"`.
+
+---
+
 ## Safety rules — enforced in code, not prompts
 
 | Rule | Enforced in |
 |---|---|
 | Caution commands require `[y/N]` confirmation | `cli.py` — Python control flow |
 | Tool names validated against `TOOL_REGISTRY` before execution | `tools.run_tool()` |
-| Unknown tool → gap logged, error observation added, loop continues | `agent.py` + `gap_log.py` |
+| Unknown tool → gap logged, error observation added, loop continues | `orchestrator.py` + `gap_log.py` |
 | Parameterized args validated (path allowlist, regex, IP check) | `tools.py` — before subprocess |
-| `shell=False` (default) for all diagnostic tools | `tools.py` |
-| `shell=True` only for user-approved caution commands | `cli.py` |
+| `shell=False` for all diagnostic tools | `tools.py` |
+| `shell=True` only for user-approved fix commands | `cli.py` |
 | Three-layer safety review on every fix command | `safety.py` |
 | Deterministic pattern check cannot be overridden by any LLM | `safety.py` |
 | Independent safety review defaults to "caution" on uncertainty | `safety.py` |
 | Strictest safety layer always wins | `safety.finalize_safety_tag()` |
-| Investigation loop hard-capped at 4 iterations | `orchestrator.py` constant |
-| Fix-retry hard-capped at 1 | `orchestrator.py` constant |
+| Investigation loop hard-capped at 4 iterations | `orchestrator.py` |
+| Fix-retry hard-capped at 1 | `orchestrator.py` `MAX_FIX_RETRIES = 1` |
 | Gap logs are local only — no telemetry | `gap_log.py` |
 | LangChain cannot bypass the whitelist | `orchestrator.py` → `tools.run_tool()` |
-
----
-
-## LLM providers
-
-| Provider | Env var | Default model | Key needed? |
-|---|---|---|---|
-| OpenRouter | `OPENROUTER_API_KEY` | `mistralai/mistral-7b-instruct:free` | ✅ Yes (free tier) |
-| NVIDIA NIM | `NVIDIA_API_KEY` | `meta/llama-3.1-8b-instruct` | ✅ Yes (trial credits) |
-| Ollama (local) | — | `llama3` | ❌ No — runs offline |
-
-Switch by editing one line in `.env`:
-```bash
-LINUXAI_PROVIDER=nvidia      # NVIDIA NIM (current default)
-LINUXAI_PROVIDER=openrouter  # OpenRouter cloud
-LINUXAI_PROVIDER=ollama      # local Ollama — no key, fully private
-```
-
-Override the model per provider:
-```bash
-NVIDIA_MODEL=meta/llama-3.3-70b-instruct
-OPENROUTER_MODEL=openai/gpt-4o-mini
-OLLAMA_MODEL=mistral          # or gemma2, phi3, codellama, etc.
-OLLAMA_BASE_URL=http://localhost:11434  # default — change for remote Ollama
-```
-
-### Using Ollama (local, private, no API key)
-
-1. **Install Ollama:** https://ollama.com/download
-2. **Pull a model:**
-   ```bash
-   ollama pull llama3       # recommended
-   ollama pull mistral      # lighter alternative
-   ollama pull gemma2       # Google's Gemma 2
-   ```
-3. **Set provider in `.env`:**
-   ```bash
-   LINUXAI_PROVIDER=ollama
-   OLLAMA_MODEL=llama3
-   ```
-4. **Run normally** — no API key required:
-   ```bash
-   python3 cli.py "why is my disk full?"
-   ```
-
-Ollama uses the same OpenAI-compatible API format as NVIDIA and OpenRouter.
-All three providers go through the exact same `call_llm()` code path in `llm_client.py`.
+| Ollama context overflow prevented by num_ctx + memory truncation | `orchestrator.py` |
 
 ---
 
@@ -421,7 +467,10 @@ All three providers go through the exact same `call_llm()` code path in `llm_cli
 | `NVIDIA_API_KEY` | — | Required for NVIDIA NIM |
 | `OPENROUTER_MODEL` | `mistralai/mistral-7b-instruct:free` | Model override |
 | `NVIDIA_MODEL` | `meta/llama-3.1-8b-instruct` | Model override |
-| `OLLAMA_MODEL` | `llama3` | Ollama model name (must be pulled locally) |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL (local or remote) |
+| `OLLAMA_MODEL` | `llama3` | Main planning/diagnosis model |
+| `OLLAMA_SAFETY_MODEL` | *(falls back to `OLLAMA_MODEL`)* | Lighter model for safety review only |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL (auto-set to `http://ollama:11434` in Docker) |
 | `LINUXAI_DEBUG` | — | Print full investigation memory trace |
 | `NO_COLOR` | — | Disable ANSI colour output |
+
+All variables are loaded automatically from a `.env` file in the project root — no `export` needed.
