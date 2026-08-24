@@ -1,0 +1,7 @@
+# git ignore
+__pycache__/
+*.pyc
+*.pyo
+.env
+tool_gap_log.jsonl
+*.log

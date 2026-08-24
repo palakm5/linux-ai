@@ -348,3 +348,224 @@ if __name__ == "__main__":
         if "output" in result and len(result["output"]) > 500:
             result = {"output": result["output"][:500] + "\n... [truncated]"}
         print(json.dumps(result, indent=2))
+
+
+# =========================================================================== #
+# FEATURE 4 — Parameterized tools (added in v2)
+# =========================================================================== #
+
+import re as _re
+
+# --------------------------------------------------------------------------- #
+# 4.1  check_directory_size — replaces fixed check_dirs with path validation
+# --------------------------------------------------------------------------- #
+
+ALLOWED_BASE_DIRS = [
+    "/var/log",
+    "/home",
+    "/tmp",
+    "/var/cache",
+    "/var/lib",
+]
+
+
+def check_directory_size(path: str) -> Dict:
+    """
+    Report disk usage for a specific allowed directory.
+
+    The path is validated against ALLOWED_BASE_DIRS before execution.
+    If the path is outside the allowed scope, returns an error without
+    running any subprocess.
+
+    Command (when valid): du -sh <path>
+    """
+    if not path or not isinstance(path, str):
+        return {"error": "check_directory_size: path must be a non-empty string"}
+
+    # Resolve any symlinks / ".." to get the real path
+    try:
+        resolved = str(Path(path).resolve())
+    except Exception:
+        resolved = path
+
+    # Validate against allowed base dirs (and their resolved symlink targets)
+    # On macOS /var/log resolves to /private/var/log — both must be accepted
+    resolved_bases = set(ALLOWED_BASE_DIRS)
+    for base in ALLOWED_BASE_DIRS:
+        try:
+            resolved_bases.add(str(Path(base).resolve()))
+        except Exception:
+            pass
+    allowed = any(
+        resolved == base or resolved.startswith(base + "/")
+        for base in resolved_bases
+    )
+    if not allowed:
+        return {
+            "error": (
+                f"Path {path!r} is outside the allowed scope. "
+                f"Allowed directories: {ALLOWED_BASE_DIRS}"
+            )
+        }
+
+    return _run(["du", "-sh", resolved])
+
+
+# --------------------------------------------------------------------------- #
+# 4.2  check_process_by_name — investigate a specific process
+# --------------------------------------------------------------------------- #
+
+# Strict allowlist for process names: letters, digits, dash, underscore only
+_PROC_NAME_RE = _re.compile(r'^[A-Za-z0-9_\-]{1,64}$')
+
+
+def check_process_by_name(name: str) -> Dict:
+    """
+    Show ps entries for processes whose command matches *name*.
+
+    The name is strictly validated: only alphanumeric, dash, and underscore
+    are allowed. Shell metacharacters are rejected before any subprocess call.
+
+    Filtering is done in Python (not via shell grep) to avoid injection risk.
+    """
+    if not name or not isinstance(name, str):
+        return {"error": "check_process_by_name: name must be a non-empty string"}
+
+    if not _PROC_NAME_RE.match(name):
+        return {
+            "error": (
+                f"Invalid process name {name!r}. "
+                "Only letters, digits, dash and underscore are allowed."
+            )
+        }
+
+    # Run ps and filter in Python — no shell pipeline, no shell=True
+    try:
+        ps = subprocess.run(
+            ["ps", "aux"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_DEFAULT_TIMEOUT,
+            text=True,
+        )
+        if ps.returncode != 0:
+            return {"error": f"ps failed (exit {ps.returncode}): {ps.stderr.strip()}"}
+
+        lines = ps.stdout.splitlines()
+        if not lines:
+            return {"output": f"No output from ps (process {name!r} not found)"}
+
+        header = lines[0]
+        # Case-insensitive filter — match against the COMMAND column
+        matched = [l for l in lines[1:] if name.lower() in l.lower()]
+
+        if not matched:
+            return {"output": f"No running processes found matching {name!r}"}
+
+        return {"output": header + "\n" + "\n".join(matched[:20])}
+
+    except subprocess.TimeoutExpired:
+        return {"error": "check_process_by_name timed out"}
+    except Exception as exc:
+        return {"error": f"check_process_by_name failed: {exc}"}
+
+
+# --------------------------------------------------------------------------- #
+# 4.3a  check_network — ping a validated host
+# --------------------------------------------------------------------------- #
+
+# RFC-1123 hostname or dotted-decimal IPv4
+_HOST_RE = _re.compile(
+    r'^(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+    r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*'
+    r'|(?:\d{1,3}\.){3}\d{1,3})$'
+)
+
+
+def check_network(host: str) -> Dict:
+    """
+    Ping *host* 4 times and return the result.
+
+    The host is validated against a hostname/IPv4 regex.
+    Shell metacharacters (;|&`$()><\\) are rejected before any subprocess call.
+    """
+    if not host or not isinstance(host, str):
+        return {"error": "check_network: host must be a non-empty string"}
+
+    host = host.strip()
+
+    # Reject shell metacharacters explicitly
+    for ch in (";", "|", "&", "`", "$", "(", ")", ">", "<", "\\", " "):
+        if ch in host:
+            return {"error": f"Invalid host: contains forbidden character {ch!r}"}
+
+    if not _HOST_RE.match(host):
+        return {
+            "error": (
+                f"Invalid hostname or IP {host!r}. "
+                "Use a plain hostname (example.com) or IPv4 address (1.2.3.4)."
+            )
+        }
+
+    # Use -c 4 on Linux, -c 4 on macOS (both support -c)
+    return _run(["ping", "-c", "4", host], timeout=20)
+
+
+# --------------------------------------------------------------------------- #
+# 4.3b  check_service_status — systemctl status for a validated service
+# --------------------------------------------------------------------------- #
+
+# Same rules as process names
+_SVC_NAME_RE = _re.compile(r'^[A-Za-z0-9_\-]{1,64}$')
+
+
+def check_service_status(service_name: str) -> Dict:
+    """
+    Return the systemctl status of *service_name*.
+
+    The service name is strictly validated: only alphanumeric, dash, and
+    underscore. Shell metacharacters are rejected before any subprocess call.
+    Falls back to a graceful error if systemctl is unavailable (e.g. Docker).
+    """
+    if not service_name or not isinstance(service_name, str):
+        return {"error": "check_service_status: service_name must be a non-empty string"}
+
+    if not _SVC_NAME_RE.match(service_name):
+        return {
+            "error": (
+                f"Invalid service name {service_name!r}. "
+                "Only letters, digits, dash and underscore are allowed."
+            )
+        }
+
+    return _run(["systemctl", "status", service_name, "--no-pager"])
+
+
+# --------------------------------------------------------------------------- #
+# 4.3c  check_open_ports — ss -tulwn (no user parameter)
+# --------------------------------------------------------------------------- #
+
+def check_open_ports() -> Dict:
+    """
+    List all listening TCP and UDP ports using ss.
+    No user-supplied parameter — zero injection risk.
+    Falls back to netstat if ss is unavailable.
+    """
+    result = _run(["ss", "-tulwn"])
+    if "error" not in result:
+        return result
+    # Fallback for systems without ss
+    return _run(["netstat", "-tulwn"])
+
+
+# --------------------------------------------------------------------------- #
+# Register new tools in the whitelist
+# --------------------------------------------------------------------------- #
+
+TOOL_REGISTRY.update({
+    "check_directory_size":  check_directory_size,
+    "check_process_by_name": check_process_by_name,
+    "check_network":         check_network,
+    "check_service_status":  check_service_status,
+    "check_open_ports":      check_open_ports,
+})

@@ -30,6 +30,12 @@ from typing import List, Optional
 from agent import run_agent, AgentResult, Command
 from tools import run_tool
 from llm_client import get_active_provider_info, LLMError
+from orchestrator import (
+    run_workflow, record_fix_failure, step_verify,
+    MAX_FIX_RETRIES, WorkflowState,
+    step_investigate, step_diagnose, step_safety_review,
+)
+import orchestrator as _orch
 
 
 # --------------------------------------------------------------------------- #
@@ -80,6 +86,8 @@ def _print_command(cmd: Command, index: int) -> None:
     print(f"      {bold('$')} {cyan(cmd.cmd)}")
     if cmd.explanation:
         print(_wrap(cmd.explanation, indent=6))
+    if cmd.safety != "safe" and getattr(cmd, "safety_reasoning", ""):
+        print(_wrap(f"⚠ Why flagged: {cmd.safety_reasoning}", indent=6))
 
 
 # --------------------------------------------------------------------------- #
@@ -139,11 +147,13 @@ def _confirm_and_run(
     index: int,
     verification_tool: Optional[str],
     before_snapshot: Optional[str],
-) -> None:
+) -> bool:
     """
     Print the caution command, ask for confirmation, run if approved.
     SAFETY: This is the only place caution commands can be executed.
     Confirmation is enforced by Python control flow, not by the LLM.
+
+    Returns True if the command ran successfully (used for retry logic).
     """
     _print_command(cmd, index)
     print()
@@ -154,9 +164,10 @@ def _confirm_and_run(
 
     if answer != "y":
         print(f"    {dim('Skipped.')}")
-        return
+        return False
 
     print(f"    {dim('Running...')}")
+    ran_ok = False
     try:
         proc = subprocess.run(
             cmd.cmd,
@@ -172,15 +183,19 @@ def _confirm_and_run(
                 print(f"    {line}")
         if proc.returncode != 0:
             print(red(f"    ⚠ Command exited with code {proc.returncode}"))
+        else:
+            ran_ok = True
     except subprocess.TimeoutExpired:
         print(red("    ✖ Command timed out after 60s"))
     except Exception as exc:
         print(red(f"    ✖ Error: {exc}"))
-        return
+        return False
 
     # Verification: compare before/after if we have a tool and a snapshot
     if verification_tool and before_snapshot is not None:
         _show_verification(verification_tool, before_snapshot)
+
+    return ran_ok
 
 
 # --------------------------------------------------------------------------- #
@@ -331,18 +346,22 @@ def main() -> None:
     print()
 
     # Check API key early and give a clear error
+    # Ollama is local and needs no key — skip the check for it
     if "error" in info or not info.get("api_key_configured"):
         prov = info.get("provider", "openrouter")
-        key_env = "NVIDIA_API_KEY" if prov == "nvidia" else "OPENROUTER_API_KEY"
-        print(red(f"  ✖  No API key configured."))
-        print(red(f"     Set {key_env} in your environment and retry."))
+        key_env = {
+            "nvidia":      "NVIDIA_API_KEY",
+            "openrouter":  "OPENROUTER_API_KEY",
+        }.get(prov, "OPENROUTER_API_KEY")
+        print(red(f"  ✖  No API key configured for provider '{prov}'."))
+        print(red(f"     Set {key_env} in your .env file or environment and retry."))
         print()
-        print(dim(f"     export {key_env}=your-key-here"))
+        print(dim(f"     echo '{key_env}=your-key-here' >> .env"))
         sys.exit(1)
 
-    # Run the agent
+    # Run via LangChain orchestrator
     try:
-        result = run_agent(query, provider=provider)
+        wf_state = run_workflow(query, provider=provider)
     except LLMError as exc:
         print(red(f"\n  ✖  LLM error: {exc}"))
         sys.exit(1)
@@ -355,17 +374,116 @@ def main() -> None:
             raise
         sys.exit(1)
 
-    # Display results
-    if result.is_file_search:
-        _display_file_search(result)
+    # ── File search: display and exit ────────────────────────────────────
+    if wf_state["is_file_search"]:
+        _header("📁  File Search Results")
+        results_text = wf_state.get("file_search_results") or "No results found."
+        for line in results_text.splitlines():
+            print(f"  {line}")
+        print()
+        print(_rule())
+        print(dim(f"  Memory entries: {len(wf_state['memory'])}"))
+        print(_rule())
+        print()
+        return
+
+    # ── Diagnostic display ───────────────────────────────────────────────
+    _header("🩺  Diagnosis")
+    print(_wrap(wf_state.get("diagnosis", "No diagnosis available."), indent=2))
+
+    # Build Command objects from workflow state (now includes safety_reasoning)
+    all_cmds = wf_state.get("commands", [])
+    safe_cmds    = [Command(c["cmd"], c["safety"], c.get("explanation",""),
+                            c.get("safety_reasoning",""))
+                    for c in all_cmds if c.get("safety") == "safe"]
+    caution_cmds = [Command(c["cmd"], c["safety"], c.get("explanation",""),
+                            c.get("safety_reasoning",""))
+                    for c in all_cmds if c.get("safety") != "safe"]
+
+    if safe_cmds:
+        _section("✅  Safe Commands  (informational — run anytime)")
+        for i, cmd in enumerate(safe_cmds, 1):
+            _print_command(cmd, i)
+
+    # ── Caution commands + bounded retry loop ────────────────────────────
+    if caution_cmds:
+        _section("⚠️   Caution Commands  (require your approval)")
+        vtool  = wf_state.get("verification_tool")
+        before = _snapshot(vtool)
+
+        for i, cmd in enumerate(caution_cmds, 1):
+            ran = _confirm_and_run(cmd, i, vtool, before)
+            if not ran:
+                continue
+
+            # Verification after the fix
+            if vtool and before:
+                after_output = _run_verification(vtool)
+                wf_state = step_verify(wf_state, after_output, before)
+
+                if wf_state.get("resolved"):
+                    print()
+                    print(green("  ✅ Issue resolved!"))
+                else:
+                    # Fix did not work — bounded retry
+                    wf_state = record_fix_failure(wf_state, cmd.cmd)
+                    retry_count = wf_state["fix_retry_count"]
+
+                    if retry_count >= MAX_FIX_RETRIES:
+                        print()
+                        print(red("  ✖  The issue remains unresolved after the maximum fix retry."))
+                        print(red("     Manual investigation may be required."))
+                    else:
+                        print()
+                        print(yellow(f"  ⟳  Fix did not resolve the issue. "
+                                     f"Re-planning (retry {retry_count}/{MAX_FIX_RETRIES})..."))
+                        # Re-enter the LangChain workflow with updated memory
+                        try:
+                            from orchestrator import step_investigate, step_diagnose, step_safety_review
+                            wf_state = step_investigate(wf_state)
+                            wf_state = step_diagnose(wf_state)
+                            wf_state = step_safety_review(wf_state)
+
+                            # Rebuild command lists from new state
+                            new_cmds = wf_state.get("commands", [])
+                            new_caution = [Command(c["cmd"], c["safety"],
+                                                   c.get("explanation",""),
+                                                   c.get("safety_reasoning",""))
+                                           for c in new_cmds if c.get("safety") != "safe"]
+                            if new_caution:
+                                _section("⚠️   Retry: New Recommended Commands")
+                                before = _snapshot(wf_state.get("verification_tool"))
+                                for j, new_cmd in enumerate(new_caution, 1):
+                                    _confirm_and_run(new_cmd, j,
+                                                     wf_state.get("verification_tool"), before)
+                            else:
+                                print(dim("  No new commands recommended by retry plan."))
+                        except Exception as retry_exc:
+                            print(red(f"  ✖  Retry planning failed: {retry_exc}"))
     else:
-        _display_diagnostic(result)
+        if wf_state.get("verification_tool"):
+            _section("🔁  Verification")
+            before = _snapshot(wf_state["verification_tool"])
+            if before:
+                _show_verification(wf_state["verification_tool"], before)
+
+    # ── Debug trace ──────────────────────────────────────────────────────
+    if os.environ.get("LINUXAI_DEBUG"):
+        _section("🐛  Debug: Investigation Memory")
+        import json
+        for entry in wf_state.get("memory", []):
+            tool  = entry.get("tool", "?")
+            res   = entry.get("result", {})
+            snip  = str(res)[:200]
+            print(f"\n  [{tool}]  {dim(snip)}")
 
     # Footer
     print()
     print(_rule())
-    iters = result.iterations_used
-    print(dim(f"  Iterations: {iters}/{4}  |  Memory entries: {len(result.memory)}"))
+    iters = wf_state.get("iterations_used", 0)
+    mem   = wf_state.get("memory", [])
+    retries = wf_state.get("fix_retry_count", 0)
+    print(dim(f"  Iterations: {iters}/{4}  |  Memory: {len(mem)}  |  Fix retries: {retries}/{MAX_FIX_RETRIES}"))
     print(_rule())
     print()
 

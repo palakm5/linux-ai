@@ -37,6 +37,13 @@ import re
 import textwrap
 from typing import Optional
 
+# ---- Load .env automatically (project root or any parent directory) ---------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()          # looks for .env in cwd and walks up the tree
+except ImportError:
+    pass                   # python-dotenv not installed — fall back to plain env vars
+
 # ---- openai SDK (both providers use the same SDK with different base_url) ---
 try:
     import openai
@@ -65,12 +72,23 @@ _PROVIDERS = {
         "api_key_env": "OPENROUTER_API_KEY",
         "model_env":   "OPENROUTER_MODEL",
         "default_model": "mistralai/mistral-7b-instruct:free",
+        "requires_key": True,
     },
     "nvidia": {
         "base_url":    "https://integrate.api.nvidia.com/v1",
         "api_key_env": "NVIDIA_API_KEY",
         "model_env":   "NVIDIA_MODEL",
         "default_model": "meta/llama-3.1-8b-instruct",
+        "requires_key": True,
+    },
+    "ollama": {
+        # base_url is overridable via OLLAMA_BASE_URL for remote/custom setups
+        "base_url":    "http://localhost:11434/v1",
+        "base_url_env": "OLLAMA_BASE_URL",
+        "api_key_env": "",            # Ollama has no API key
+        "model_env":   "OLLAMA_MODEL",
+        "default_model": "llama3",    # override with OLLAMA_MODEL=mistral etc.
+        "requires_key": False,
     },
 }
 
@@ -95,19 +113,36 @@ def _build_client(provider_name: str) -> tuple:
     """
     Build an openai.OpenAI client configured for the given provider.
     Returns (client, model_name).
+
+    Ollama note: Ollama's REST API is OpenAI-compatible. No real API key
+    is required — we pass the literal string "ollama" so the SDK is happy.
+    The base URL can be overridden via OLLAMA_BASE_URL for remote setups.
     """
     cfg = _PROVIDERS[provider_name]
-    api_key = os.environ.get(cfg["api_key_env"], "").strip()
-    if not api_key:
-        raise LLMError(
-            f"Missing API key for provider {provider_name!r}. "
-            f"Set the {cfg['api_key_env']} environment variable."
-        )
+
+    # ── API key ──────────────────────────────────────────────────────────
+    if cfg.get("requires_key", True):
+        api_key = os.environ.get(cfg["api_key_env"], "").strip()
+        if not api_key:
+            raise LLMError(
+                f"Missing API key for provider {provider_name!r}. "
+                f"Set the {cfg['api_key_env']} environment variable."
+            )
+    else:
+        # Ollama: no real key needed — use a placeholder the SDK accepts
+        api_key = os.environ.get(cfg.get("api_key_env", ""), "ollama") or "ollama"
+
+    # ── Base URL (Ollama allows override for remote/proxied instances) ────
+    base_url = cfg["base_url"]
+    if "base_url_env" in cfg:
+        base_url = os.environ.get(cfg["base_url_env"], base_url).rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = base_url + "/v1"
+
+    # ── Model ─────────────────────────────────────────────────────────────
     model = os.environ.get(cfg["model_env"], cfg["default_model"]).strip()
-    client = openai.OpenAI(
-        api_key=api_key,
-        base_url=cfg["base_url"],
-    )
+
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
     return client, model
 
 
@@ -235,17 +270,28 @@ def call_llm(
 def get_active_provider_info() -> dict:
     """
     Return a summary of the currently configured provider & model.
-    Useful for CLI diagnostics / --version output.
+    Useful for CLI diagnostics / --info flag.
     """
     try:
         provider_name = _get_provider_name()
         cfg = _PROVIDERS[provider_name]
         model = os.environ.get(cfg["model_env"], cfg["default_model"])
-        api_key_set = bool(os.environ.get(cfg["api_key_env"], "").strip())
+
+        # Base URL (Ollama may be overridden)
+        base_url = cfg["base_url"]
+        if "base_url_env" in cfg:
+            base_url = os.environ.get(cfg["base_url_env"], base_url)
+
+        # API key status — Ollama never needs one
+        if cfg.get("requires_key", True):
+            api_key_set = bool(os.environ.get(cfg["api_key_env"], "").strip())
+        else:
+            api_key_set = True   # local Ollama needs no key — always "configured"
+
         return {
-            "provider": provider_name,
-            "base_url": cfg["base_url"],
-            "model": model,
+            "provider":          provider_name,
+            "base_url":          base_url,
+            "model":             model,
             "api_key_configured": api_key_set,
         }
     except LLMError as e:

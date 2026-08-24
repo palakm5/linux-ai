@@ -35,6 +35,8 @@ from typing import Any, Dict, List, Optional
 
 from tools import TOOL_REGISTRY, run_tool
 from llm_client import call_llm, LLMError
+from gap_log import log_tool_gap
+from safety import finalize_safety_tag
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +49,9 @@ MAX_ITERATIONS = 4
 @dataclass
 class Command:
     cmd: str
-    safety: str          # "safe" | "caution"
+    safety: str          # "safe" | "caution" — FINAL tag after 3-layer review
     explanation: str
+    safety_reasoning: str = ""   # why it was flagged (from three-layer review)
 
 
 @dataclass
@@ -91,28 +94,55 @@ _PLAN_SYSTEM = """\
 You are linuxai, a Linux system diagnostic agent.
 You investigate system issues step by step.
 
-Available tools: {tool_names}
+AVAILABLE TOOLS
+---------------
+Zero-argument tools (tool_args = {{}}):
+  check_disk            - df -h: filesystem usage for all mounts
+  check_memory          - free -h: RAM and swap usage
+  check_processes       - top 10 processes by memory
+  check_logs            - last 20 error log entries
+  check_open_ports      - listening TCP/UDP ports (ss -tulwn)
+  check_dirs            - du for /var/log and /home
 
-Each tool returns a dict with either "output" or "error".
+Parameterized tools (supply tool_args as shown):
+  check_directory_size(path)
+      Check disk usage for one specific directory.
+      Allowed paths: /var/log, /home, /tmp, /var/cache, /var/lib
+      Example: {{"path": "/var/log"}}
 
-You will be given:
-- The user's original query.
-- The investigation memory so far (list of tool results).
+  check_process_by_name(name)
+      Investigate a specific process by name.
+      name: letters, digits, dash, underscore only.
+      Example: {{"name": "nginx"}}
+
+  check_network(host)
+      Ping a hostname or IP (4 packets).
+      host: plain hostname or IPv4, no shell characters.
+      Example: {{"host": "example.com"}}
+
+  check_service_status(service_name)
+      systemctl status for a Linux service.
+      service_name: letters, digits, dash, underscore only.
+      Example: {{"service_name": "nginx"}}
+
+  find_files(pattern, path)
+      Search for files by natural-language pattern.
+      Example: {{"pattern": "*.log", "path": "/var/log"}}
+
+Rules:
+- next_tool MUST be one of the tool names listed above.
+- Set sufficient=true when you have enough information to diagnose the problem.
+- Do NOT repeat a tool already in memory unless memory is empty.
+- After {max_iter} total tool calls you MUST set sufficient=true.
+- For unknown/unsupported tools return sufficient=true instead.
 
 Respond with ONLY a JSON object in exactly this schema:
 {{
   "sufficient": true or false,
-  "next_tool":  "<tool name from the list, or null if sufficient=true>",
+  "next_tool":  "<tool name or null if sufficient=true>",
   "tool_args":  {{}},
   "reasoning":  "<one sentence: what you learned and why you chose this tool>"
-}}
-
-Rules:
-- Set sufficient=true when you have enough information to diagnose the problem.
-- next_tool MUST be one of: {tool_names}
-- tool_args for most tools is {{}}; for find_files use {{"pattern": "...", "path": "..."}}
-- Do NOT repeat a tool that already has results in memory unless memory is empty.
-- After {max_iter} total tool calls you must set sufficient=true."""
+}}"""
 
 
 _DIAGNOSE_SYSTEM = """\
@@ -281,6 +311,15 @@ def run_agent(query: str, provider: Optional[str] = None) -> AgentResult:
                 f"Treating as observation error."
             )
             print(f"  ⚠️  {err}")
+            # Log capability gap locally — never executes the tool
+            log_tool_gap(
+                query=query,
+                memory=list(memory),
+                missing_tool=next_tool,
+                reason="tool not in whitelist",
+            )
+            print(f"  📝 Capability gap recorded. "
+                  f"No suitable diagnostic tool is currently available for this step.")
             memory.append({
                 "tool": next_tool,
                 "args": tool_args,
@@ -350,16 +389,28 @@ def run_agent(query: str, provider: Optional[str] = None) -> AgentResult:
     safe_commands: List[Command] = []
     caution_commands: List[Command] = []
 
+    print("\n🛡️  Running three-layer safety review on commands...")
     for raw_cmd in diagnosis_raw.get("commands", []):
         if not isinstance(raw_cmd, dict):
             continue
-        cmd_str  = str(raw_cmd.get("cmd", "")).strip()
-        safety   = str(raw_cmd.get("safety", "caution")).lower().strip()
-        explain  = str(raw_cmd.get("explanation", "")).strip()
+        cmd_str      = str(raw_cmd.get("cmd", "")).strip()
+        gen_safety   = str(raw_cmd.get("safety", "caution")).lower().strip()
+        explain      = str(raw_cmd.get("explanation", "")).strip()
         if not cmd_str:
             continue
-        c = Command(cmd=cmd_str, safety=safety, explanation=explain)
-        if safety == "safe":
+
+        # Three-layer safety: generator tag + pattern check + independent LLM review
+        safety_result = finalize_safety_tag(cmd_str, gen_safety, provider=provider)
+        final_tag     = safety_result["final_tag"]
+        safety_reason = safety_result["reasoning"]
+
+        c = Command(
+            cmd=cmd_str,
+            safety=final_tag,
+            explanation=explain,
+            safety_reasoning=safety_reason,
+        )
+        if final_tag == "safe":
             safe_commands.append(c)
         else:
             caution_commands.append(c)

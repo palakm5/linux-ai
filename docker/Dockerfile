@@ -19,21 +19,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         coreutils \
         findutils \
         util-linux \
+        systemd \
         dmesg \
         stress-ng \
         curl \
+        iproute2 \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python dependencies ───────────────────────────────────────────────────────
-RUN pip3 install --no-cache-dir openai
+RUN pip3 install --no-cache-dir openai langchain langchain-core python-dotenv
 
 # ── Copy project source ───────────────────────────────────────────────────────
 WORKDIR /app
-COPY tools.py       ./tools.py
-COPY llm_client.py  ./llm_client.py
-COPY agent.py       ./agent.py
-COPY cli.py         ./cli.py
+COPY tools.py        ./tools.py
+COPY llm_client.py   ./llm_client.py
+COPY agent.py        ./agent.py
+COPY cli.py          ./cli.py
+COPY safety.py       ./safety.py
+COPY gap_log.py      ./gap_log.py
+COPY orchestrator.py ./orchestrator.py
 
 # ── Copy seed script and make it executable ───────────────────────────────────
 COPY docker/seed_problems.sh /usr/local/bin/seed_problems

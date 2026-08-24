@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# linuxai docker-compose
+#
+# Profiles
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Cloud providers (NVIDIA / OpenRouter) — no Ollama needed:
+#      docker compose --profile cloud up -d
+#      docker compose exec linuxai bash
+#
+# 2. Ollama (local models, fully private):
+#      docker compose --profile ollama up -d
+#      docker compose exec ollama ollama pull llama3
+#      docker compose exec ollama ollama pull mistral
+#      docker compose exec linuxai bash
+#      # inside container:  LINUXAI_PROVIDER=ollama linuxai "why is disk full?"
+#
+# 3. Both cloud + ollama at once:
+#      docker compose --profile cloud --profile ollama up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── linuxai diagnostic container ──────────────────────────────────────────
+  linuxai:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: linuxai:latest
+    container_name: linuxai
+    profiles: ["cloud", "ollama"]          # always starts with either profile
+    stdin_open: true
+    tty: true
+    environment:
+      # ── Provider selection ─────────────────────────────────────────────────
+      # Set LINUXAI_PROVIDER to: nvidia | openrouter | ollama
+      LINUXAI_PROVIDER: ${LINUXAI_PROVIDER:-nvidia}
+
+      # ── Cloud provider keys (passed from host env or .env) ─────────────────
+      NVIDIA_API_KEY:       ${NVIDIA_API_KEY:-}
+      NVIDIA_MODEL:         ${NVIDIA_MODEL:-meta/llama-3.1-8b-instruct}
+      OPENROUTER_API_KEY:   ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL:     ${OPENROUTER_MODEL:-mistralai/mistral-7b-instruct:free}
+
+      # ── Ollama settings ────────────────────────────────────────────────────
+      # When running with --profile ollama, the ollama service is reachable
+      # at http://ollama:11434 inside the Docker network.
+      OLLAMA_BASE_URL:      ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL:         ${OLLAMA_MODEL:-llama3}
+      OLLAMA_SAFETY_MODEL:  ${OLLAMA_SAFETY_MODEL:-mistral}
+
+      # ── Debug ──────────────────────────────────────────────────────────────
+      LINUXAI_DEBUG:        ${LINUXAI_DEBUG:-}
+
+    volumes:
+      # Persist gap log across container restarts
+      - linuxai_data:/app/data
+    networks:
+      - linuxai_net
+    depends_on:
+      ollama:
+        condition: service_healthy
+        required: false        # optional — only needed with --profile ollama
+
+  # ── Ollama service (local LLM server) ─────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"          # also expose to host so you can use it outside Docker
+    volumes:
+      - ollama_models:/root/.ollama   # persist downloaded models
+    networks:
+      - linuxai_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    # Pull both models automatically on first start
+    # Override with OLLAMA_MODEL / OLLAMA_SAFETY_MODEL env vars
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        OLLAMA_PID=$$!
+        echo "Waiting for Ollama to be ready..."
+        until curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; do
+          sleep 1
+        done
+        echo "Pulling main model: ${OLLAMA_MODEL:-llama3} ..."
+        ollama pull ${OLLAMA_MODEL:-llama3}
+        echo "Pulling safety model: ${OLLAMA_SAFETY_MODEL:-mistral} ..."
+        ollama pull ${OLLAMA_SAFETY_MODEL:-mistral}
+        echo "Both models ready. Ollama is up."
+        wait $$OLLAMA_PID
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  ollama_models:      # persists pulled models — no re-download on restart
+  linuxai_data:       # persists tool_gap_log.jsonl
+
+# ── Network ───────────────────────────────────────────────────────────────────
+networks:
+  linuxai_net:
+    driver: bridge
